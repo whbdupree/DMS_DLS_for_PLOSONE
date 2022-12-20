@@ -1,0 +1,446 @@
+import numpy as np
+import jax.numpy as jnp
+from jax import jit, lax
+from jax.ops import index,index_update
+from jax.random import split,uniform,PRNGKey
+from functools import partial
+from matplotlib import pyplot as plt
+
+from .figures import panels, performance, plot_dXs, compare_pfc_dysfunction
+
+# these guys are used to determine D1,D2 inputs for the dms,dls
+dms_ctx_gain = .4
+
+pfc_inputs = jnp.array( [ 1.5 , 1.5 ] )
+
+w_dms_pfc = 1.8  #this is the dms gpi->pfc weight
+w_pfc_pmc = 0.1
+w_pmc_d1 = 2.0
+w_pmc_d2 = 2.0
+d_gpe = 1.6
+w_d2_gpe = 2.0
+w_gpe_stn = 1.0
+d_gpi = 0.2
+w_d1_gpi = 1.4
+w_stn_gpi = 1.6
+d_pmc = 1.3
+w_gpi_pmc = 1.8
+w_pmc_pmc = 1.6
+w_pfc_pfc = 1.6
+w_stn_gpe = 0.4
+w_hd = 0.3
+d_stn = 0.8
+
+# configure simulation time step
+dt = .15
+nn = 5000
+
+def ss( I ):
+    # steady state function for neuronal populations
+    # produces steady state firing rate given some input I.
+    return jnp.tanh( jnp.clip(I, a_min =0) )
+
+
+# time constants for bg populations in correct order for a single bg loop
+tau = jnp.array([  15., 15., 20., 12.8, 15.,  ])
+
+def solve_bgloop( yy, I_d1, I_d2, this_pmc, rr ):
+    # yy: state
+    # I_d1: we've already computed the current input for d1 msn
+    # I_d2: we've already computed the current input for d2 msn
+    # this pmc: activity of pmc for this loop    
+    # rr: uniform noise over 0 , .1 ; same length as yy
+
+    
+    # rename variables for sanity
+    msnd1 = yy[0]
+    msnd2 = yy[1]
+    gpe   = yy[2]
+    stn   = yy[3]
+    gpi   = yy[4]
+
+    I = jnp.array(
+        [ I_d1,
+          I_d2,
+          d_gpe - (w_d2_gpe * msnd2) + (w_stn_gpe * stn),
+          d_stn - (w_gpe_stn * gpe) + (w_hd * this_pmc),
+          d_gpi - (w_d1_gpi * msnd1) + (w_stn_gpi * stn) ]
+    )
+
+    return ( ( ss(I) - yy + rr) / tau )
+
+
+def solve_pmcs( this_pmc, pfc, gpi_dls, other_pmc, rr ):
+    # this_pmc: activity of this pmc
+    # pfc: activity of _both_ pfc
+    # gpi_dls: activity of dls gpi for this loop
+    # other_pmc: activity of opposing pmc
+    # rr: noise
+    
+    gpi = w_gpi_pmc * gpi_dls
+    I = d_pmc + ( w_pfc_pmc * pfc ) - gpi - (w_pmc_pmc * other_pmc)
+    return( (ss(I) - this_pmc + rr )/ 15. )
+
+def solve_pfcs( pfc, gpi_dms, pfc_input, other_pfc, rr ):
+    # this_pfc: activity of this pfc
+    # gpi_dms: activity of dms gpi for this loop
+    # pfc_input: tonic input to pfc for this loop
+    I = pfc_input - w_dms_pfc * gpi_dms - w_pfc_pfc * other_pfc
+    return ( ss(I) - pfc + rr ) / 15.
+
+def ten_steps( simulation_state, w_ctx ):
+    pss = partial( simulation_step, w_ctx = w_ctx )
+
+    cortex_,bg_,key_ = lax.fori_loop( 1, 10, pss, simulation_state )
+
+    return [cortex_,bg_,key_]
+              
+def simulation_step_save_state( i, simulation_timeseries_state, w_ctx ):
+    # i: iteration time for simulation
+    # simulation_timeseries_state: packaged time series and PRNG state
+    # this is the state that is "carried" from one loop to the next
+    # w_ctx: cortical weights are constant input to simulation state
+
+    ## this method wraps the simulation_step method, and writes to a time series
+    # unpack simulation state
+    cortex, bg, key = simulation_timeseries_state
+    # get "initial condition" for this integration step
+    cortex0 = cortex[:,:,i-1]
+    bg0 = bg[:,:,:,i-1]
+    # repackage for use by simulation_step(...)
+    state_for_simulation_step = [ cortex0, bg0, key]
+    # take one euler step
+    #cortex_i , bg_i , key = simulation_step( i, state_for_simulation_step, w_ctx )
+
+    # take ten euler steps
+    cortex_i, bg_i, key = ten_steps( state_for_simulation_step, w_ctx )
+    # update time series
+    bg = index_update( bg, index[:,:,:,i], bg_i )
+    cortex = index_update( cortex, index[:,:,i], cortex_i )
+    # carry state to next iteration
+    return [ cortex, bg, key ]
+
+def simulation_step( i, simulation_state, w_ctx,
+                     gain_pfc = 1.,
+                     rotate_pfc = 1. ):
+    # i: iteration time for simulation
+    # simulation_state: packaged ODE state and PRNG state
+    # this is the state that is "carried" from one loop to the next
+    # w_ctx: cortical weights are constant input to simulation state
+    
+    # this method takes ODE state and PRNG state and then produces the next state
+    # (one euler step)
+
+    # unpack simulation_state
+    cortex0, bg0, key = simulation_state
+
+    # unpack cortex and bg
+    #pfc0, pmc0 = cortex0
+
+    pfc0,pmc0 = cortex0
+    #pfc0 is the real pfc activity
+    
+    # let's compute effective pfc:
+    # what share of each pfc population is input to each dms channel?
+    pfcA,pfcB = pfc0
+    pfc_1 = pfcA * rotate_pfc + pfcB * (1.-rotate_pfc)
+    pfc_2 = pfcB * rotate_pfc + pfcA * (1.-rotate_pfc)
+
+    dms0, dls0 = bg0
+    dms_goA, dms_goB = dms0
+    dls_goA, dls_goB = dls0
+
+    key, subkey = split( key ) # jax makes us handle prng state ourselves
+    rr = 0.1 * uniform( subkey, (24,) ) 
+
+    # unpack plastic weights and give them meaningful names
+    w_pfc_dms = w_ctx[:, :2, :] 
+    w_pmc_dls = w_ctx[:, 2:,:]
+
+
+    ## dms derivatives
+    # dms action A
+    I_d1 = dms_ctx_gain * w_pfc_dms[0][0][0] * pfc_1*gain_pfc
+    I_d2 = dms_ctx_gain * w_pfc_dms[0][1][0] * pfc_1*gain_pfc
+    dms_goA_derivative = solve_bgloop( dms_goA, I_d1, I_d2,
+                                       0, rr[:5] )
+    # dms action B    
+    I_d1 = dms_ctx_gain * w_pfc_dms[1][0][1] * pfc_2*gain_pfc
+    I_d2 = dms_ctx_gain * w_pfc_dms[1][1][1] * pfc_2*gain_pfc
+    dms_goB_derivative = solve_bgloop( dms_goB, I_d1, I_d2,
+                                       0, rr[5:10] )    
+    dms_derivatives =  [dms_goA_derivative, dms_goB_derivative]
+
+
+    ## dls derivatives
+    
+    # dls action A    
+    I_d1 = w_pmc_dls[0][0][0] * pmc0[0]
+    I_d2 = w_pmc_dls[0][1][0] * pmc0[0]
+    dls_goA_derivative = solve_bgloop( dls_goA,  I_d1, I_d2,
+                                       pmc0[0], rr[10:15] )
+    # dls action B    
+    I_d1 = w_pmc_dls[1][0][1] * pmc0[1]
+    I_d2 = w_pmc_dls[1][1][1] * pmc0[1]
+    dls_goB_derivative = solve_bgloop( dls_goB,  I_d1, I_d2,
+                                       pmc0[1], rr[15:20] )
+    dls_derivatives =  [dls_goA_derivative, dls_goB_derivative]
+    
+    bg_deriv = jnp.array([dms_derivatives,dls_derivatives])
+
+
+    # get cortical derivatives
+    gpi_dmsA = dms_goA[4]
+    gpi_dmsB = dms_goB[4]
+    gpi_dms_1 = gpi_dmsA * rotate_pfc + gpi_dmsB * (1.-rotate_pfc)
+    gpi_dms_2 = gpi_dmsB * rotate_pfc + gpi_dmsA * (1.-rotate_pfc)    
+    pfc1_derivative = solve_pfcs( pfc0[0], gpi_dms_1, pfc_inputs[0],pfc0[1],rr[-4] )
+    pfc2_derivative = solve_pfcs( pfc0[1], gpi_dms_2, pfc_inputs[1],pfc0[0],rr[-3] )    
+    pfc_derivative = jnp.array( [pfc1_derivative, pfc2_derivative] )
+    
+    gpi_dlsA = dls_goA[4]
+    gpi_dlsB = dls_goB[4]
+    effective_pfc = jnp.array( [ pfc_1,pfc_2 ])
+    pmcA_derivative =  solve_pmcs( pmc0[0], (effective_pfc[0] *gain_pfc), gpi_dlsA,
+                                   pmc0[1], rr[-2] )
+    pmcB_derivative =  solve_pmcs( pmc0[1], (effective_pfc[1] *gain_pfc), gpi_dlsB,
+                                   pmc0[0], rr[-1] )
+
+    cortex_derivative = jnp.array( [pfc_derivative,
+                                    [pmcA_derivative,pmcB_derivative] ] )
+
+    # step bg
+    bg = bg0 + bg_deriv*dt 
+    # step cortex
+    cortex = cortex0 + cortex_derivative * dt
+
+    return [ cortex, bg, key ]
+
+
+def do_trial_for_figure( key, w_ctx ):
+    ## this method runs one trial and saves a time series; it does not do weigh updated
+    # key: PRNG state
+    # w_ctx: plastic cortical weights should be configured and passed to this method as an argument
+    
+    key, *subkey = split( key,4 ) 
+
+    mm = int(nn / 10)
+    cortex = jnp.zeros((2,2,mm))
+    cortex = index_update( cortex, index[:,:,0], 0.1 * uniform(subkey[0],(2,2) ) )    
+
+    
+    bg = jnp.zeros((2,2,5,mm))
+    bg = index_update( bg, index[:,:,:,0], 0.1 * uniform(subkey[1],(2,2,5) ) )
+    bg = index_update( bg, index[:,:,2,0], 0.6 + 0.1 * uniform(subkey[2],(2,2) ) )  # gpe
+
+    simulation_state = [ cortex, bg, key ]
+    sim_step = partial( simulation_step_save_state, w_ctx = w_ctx  )
+    
+    # for debugging purposes use this loop:
+    #for i in range(nn-1):
+    #    simulation_state = sim_step(i+1,simulation_state)
+    
+    # for performance use this "loop":
+    cortex , bg, _ = lax.fori_loop( 1, mm, sim_step, simulation_state )
+    return cortex , bg
+
+
+def do_trial( i, trial_state,
+              reversal_learning_flag = False,
+              reward_coefficient = 1.,
+              gain_pfc = 1.,
+              rotate_pfc = 1. ):
+    
+    ## this method runs one simulation trial and updates synaptic weights
+    # trial_state: the state of a trial includes the PRNG state, the synaptic weights, and reward information
+    # reversal_learning_flag: used to determine which action is rewarded; bool
+    key  = trial_state[0]
+    w_ctx_array = trial_state[1]
+    R_array = trial_state[2]
+    #Re   = trial_state[2][0]
+    #Re_DLS_last = trial_state[2][3]    
+    Re = R_array[0][i]
+    Re_DLS_last = R_array[3][i]    
+    w_ctx = w_ctx_array[:,:,:,i]
+    
+    # there is other reward information embedded in trial_state[2],
+    # (used for figures) but we only need Re to perform a simulation.
+
+    key, *subkey = split( key,4 ) 
+
+    # set ODE initial conditions
+    #cortex = jnp.zeros((2,2))
+
+    cortex = 0.1 * uniform( subkey[0],(2,2) ) # pmc
+    
+    bg = jnp.zeros((2,2,5))
+    bg = index_update( bg, index[:,:,:], 0.1 * uniform(subkey[1],(2,2,5) ) )
+    bg = index_update( bg, index[:,:,2], 0.6 + 0.1 * uniform(subkey[2],(2,2) ) )  # gpe; from plos_one matlab code
+
+    # package simulation state
+    simulation_state = [ cortex, bg, key ]
+    # the jax for loop construct is picky about how arguments are passed to function
+    # we are storing w_ctx as state in the partial so that the jax for loop construct doesn't have to handle it
+    sim_step = partial( simulation_step, w_ctx = w_ctx, gain_pfc = gain_pfc, rotate_pfc = rotate_pfc )
+    
+    # for debugging purposes use this loop:
+    #for i in range(nn-1):
+    #    simulation_state = sim_step(i+1,simulation_state)
+    # for performance use this "loop":
+    cortex , bg, _ = lax.fori_loop( 1, nn, sim_step, simulation_state )
+
+
+    ## now we go about the business of updating synaptic weights
+    # rename variables for sanity
+    dms,dls = bg
+    
+    dms_d1A,dms_d2A = dms[0][:2]
+    dms_d1B,dms_d2B = dms[1][:2]
+    dls_d1A,dls_d2A = dls[0][:2]
+    dls_d1B,dls_d2B = dls[1][:2]
+    pfc_real,pmc = cortex
+
+    # let's compute effective pfc:
+    # what share of each pfc population is input to each dms channel?
+    pfcA,pfcB = pfc_real
+    pfc1 = pfcA * rotate_pfc + pfcB * (1.-rotate_pfc)
+    pfc2 = pfcB * rotate_pfc + pfcA * (1.-rotate_pfc)
+    pfc = jnp.array([pfc1,pfc2])
+    
+    pmcA,pmcB = pmc
+
+    ## these lax.cond things are the "easy" way to to conditional logic with jax. please look at the jax documentation
+    # this picks the rewarded pmc
+    rewardedPmc, otherPmc = lax.cond( reversal_learning_flag,
+                                      pmc,
+                                      lambda x: [x[1],x[0]],
+                                      pmc,
+                                      lambda x: [x[0],x[1]] )
+
+    # this determines reward for this trial
+    R_trial_raw = lax.cond( rewardedPmc > otherPmc + 0.1,
+                            None,
+                            lambda x: 1,
+                            None,
+                            lambda x: 0 )
+    R_trial = R_trial_raw * reward_coefficient
+    # reward prediction error:
+    SNc = R_trial - Re # this is RPE
+    # expected reward for next trial:
+    a = 0.15
+    Re_next = a * R_trial + (1 - a)*Re
+    Re_DLS = a * jnp.abs(R_trial) + (1 - a)*Re_DLS_last
+    #the order here:
+    #pfc->dmsD1, pfc->dmsD2, pfc->dlsD1, pfc->dlsD1, pfc->pmc, pmc->dlsD1, pmc->dlsD2
+    #pfc->dmsD1, pfc->dmsD2, pmc->dlsD1, pmc->dlsD2
+    # learning rates; should be shape (4,1)
+    pfc_pmc_learn_rate = 0
+    dls_learn_rate_mod = 0.5
+    learn_rate =  jnp.array([ 0.5,  -0.25,
+                              0.5 * dls_learn_rate_mod,
+                              -0.25 * dls_learn_rate_mod] ).reshape(4,1)
+
+    # forgetting rates; should be shape (4,1)
+    pmc_dls_forget_rate = 0.02
+    pfc_pmc_forget_rate = 0
+    forget_rate = jnp.array( [ 0.02, 0.02,
+                               pmc_dls_forget_rate,
+                               pmc_dls_forget_rate ] ).reshape(4,1)
+    
+    # presyanptic populations for weight updated
+    presynaptic = jnp.array( [pfc * gain_pfc]*2 + [pmc]*2 ).reshape(4,2)
+    
+    # postsynaptic populations for weight update
+    # from here out A,B correspond to action A and action B. 
+    postsynapticA = jnp.array( [ dms_d1A, dms_d2A, dls_d1A, dls_d2A ] ).reshape(4,1)
+    postsynapticB = jnp.array( [ dms_d1B, dms_d2B, dls_d1B, dls_d2B ] ).reshape(4,1)
+
+    # what rule is used to updated weights; notice the "1" in here is the hebbian update
+    update_type = jnp.array(  [ SNc ]*2 + [ 0.1*Re_DLS ]*2  ).reshape(4,1)
+
+    # compute learning rates
+    learn = learn_rate * presynaptic * update_type * jnp.array([postsynapticA,postsynapticB])
+
+    # compute "forgetting" rates
+
+    #w_ss = jnp.ones((2,4,2))
+    # we set the "off channel" weight's steady state values to zero
+    #w_ss = index_update(w_ss, index[0,:2,1],[0,0]) 
+    #w_ss = index_update(w_ss, index[1,:2,0],[0,0])    
+    #w_ss = index_update(w_ss, index[:,4 ,:],[0,0]) # hebbian stead state is 0
+    forget = forget_rate * ( w_ctx - 1. )
+
+    # what is the value of the update?
+    dw_ctx = learn - forget
+    
+    # update weights and "clip" them to a minimum value of 0
+    w_ctx = jnp.clip( w_ctx+dw_ctx , a_min = 0)
+    
+    cortex_array = trial_state[3]
+    cortex_array = index_update( cortex_array, index[:,:,i], cortex )
+    
+    w_ctx_array = index_update( w_ctx_array, index[:,:,:,i+1], w_ctx)
+    R_array = index_update( R_array, index[:,i+1], jnp.array([Re_next,R_trial,SNc, Re_DLS]) )
+    return key, w_ctx_array, R_array, cortex_array
+
+def do_trial_no_update( key,
+                        w_ctx,
+                        reversal_learning_flag = False,
+                        reward_coefficient = 1.,
+                        gain_pfc = 1.,
+                        rotate_pfc = 1. ):
+    
+
+
+    key, *subkey = split( key,4 ) 
+
+    cortex = 0.1 * uniform( subkey[0],(2,2) ) 
+    bg = jnp.zeros((2,2,5))
+    bg = index_update( bg, index[:,:,:], 0.1 * uniform(subkey[1],(2,2,5) ) )
+    bg = index_update( bg, index[:,:,2], 0.6 + 0.1 * uniform(subkey[2],(2,2) ) )  # gpe; from plos_one matlab code
+
+    simulation_state = [ cortex, bg, key ]
+    sim_step = partial( simulation_step, w_ctx = w_ctx, gain_pfc = gain_pfc, rotate_pfc = rotate_pfc )
+    cortex , bg, _ = lax.fori_loop( 1, nn, sim_step, simulation_state )
+    pfc_real,pmc = cortex
+    pfcA,pfcB = pfc_real
+    pfc1 = pfcA * rotate_pfc + pfcB * (1.-rotate_pfc)
+    pfc2 = pfcB * rotate_pfc + pfcA * (1.-rotate_pfc)
+    pfc = jnp.array([pfc1,pfc2])
+    
+    return( jnp.array([ pfc, pmc]) )
+
+
+
+
+def session( key,
+             w_ctx,
+             n_trial,
+             reversal_learning_flag = False,
+             reward_coefficient = 1.,
+             gain_pfc = 1.,
+             rotate_pfc = 1. ):
+    
+    key, subkey = split( key ) 
+
+    Re = 1. # expected reward starts at 1
+
+    w_ctx_out = jnp.zeros((2,4,2,n_trial))
+    w_ctx_out = index_update( w_ctx_out, index[:,:,:,0], w_ctx )
+    
+    R_out = jnp.zeros((4,n_trial))
+    R_out = index_update( R_out, index[:,0], jnp.array([Re,0.,0.,Re]) )
+    ctx_out = jnp.zeros((2,2,n_trial))
+    
+    session_state = (subkey, w_ctx_out, R_out, ctx_out )
+
+    pdt = partial( do_trial,
+                   reversal_learning_flag = reversal_learning_flag,
+                   reward_coefficient = reward_coefficient,
+                   gain_pfc = gain_pfc,
+                   rotate_pfc = rotate_pfc)
+    
+    session_state = lax.fori_loop( 0, n_trial, pdt, session_state )
+
+    return session_state
+    
