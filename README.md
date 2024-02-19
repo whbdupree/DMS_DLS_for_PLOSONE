@@ -1,6 +1,10 @@
 # 2m2c
 
-This repository contains the simulation code and analysis for our model of basal ganglia learning that includes both the DMS and DLS. These codes require the `jax`, `numpy`, `scipy`, and `matplotlib` python packages. We performed these simulations using python version 3.8.10 and `jax` version 0.2.
+This repository contains the simulation code and analysis for our model of basal ganglia learning that includes both the DMS and DLS. The publication that describes this model can be found here: [Distinct cortico-striatal compartments drive competition between adaptive and automatized behavior - PubMed (nih.gov)](https://pubmed.ncbi.nlm.nih.gov/36943842/)
+
+`Barnett WH, Kuznetsov A, Lapish CC. Distinct cortico-striatal compartments drive competition between adaptive and automatized behavior. PLoS One. 2023 Mar 21;18(3):e0279841.`
+
+These codes require the `jax`, `numpy`, `scipy`, and `matplotlib` python packages. We performed these simulations using python version 3.8.10 and `jax` version 0.2.
 
 All figures are saved in the `figs` subdirectory.
 
